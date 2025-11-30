@@ -1,0 +1,243 @@
+import os
+import time
+import json
+import sqlite3
+import threading
+import random
+import smtplib
+from datetime import datetime, timedelta
+from collections import deque
+from email.message import EmailMessage
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+DB_PATH = "water_monitor.db"
+LOG_FILE = "water_alerts.log"
+SENSOR_POLL_INTERVAL = 5
+MOVING_AVG_WINDOW = 6
+ALERT_COOLDOWN_SECONDS = 300
+EMAIL_ALERTS = False
+EMAIL_CONFIG = {
+    "smtp_server": "smtp.example.com",
+    "smtp_port": 587,
+    "username": "user@example.com",
+    "password": "password",
+    "from_addr": "monitor@example.com",
+    "to_addrs": ["caregiver@example.com"]
+}
+
+DEFAULT_THRESHOLDS = {
+    "pH": {"min": 6.5, "max": 8.5, "delta": 1.0},
+    "turbidity": {"min": 0.0, "max": 5.0, "delta": 5.0},
+    "temperature": {"min": 5.0, "max": 40.0, "delta": 5.0},
+    "tds": {"min": 0, "max": 500, "delta": 200}
+}
+
+os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS readings(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, pH REAL, turbidity REAL, temperature REAL, tds REAL)")
+    cur.execute("CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, type TEXT, parameter TEXT, value REAL, message TEXT)")
+    conn.commit()
+    return conn
+
+DB = init_db()
+DB_LOCK = threading.Lock()
+
+def log_alert(message):
+    ts = datetime.utcnow().isoformat()
+    line = f"{ts} | {message}\n"
+    with open(LOG_FILE, "a") as f:
+        f.write(line)
+    print(line, end="")
+
+def send_email_alert(subject, body):
+    if not EMAIL_ALERTS:
+        return
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = EMAIL_CONFIG["from_addr"]
+        msg["To"] = ", ".join(EMAIL_CONFIG["to_addrs"])
+        msg.set_content(body)
+        with smtplib.SMTP(EMAIL_CONFIG["smtp_server"], EMAIL_CONFIG["smtp_port"]) as s:
+            s.starttls()
+            s.login(EMAIL_CONFIG["username"], EMAIL_CONFIG["password"])
+            s.send_message(msg)
+    except Exception as e:
+        log_alert(f"Email alert failed: {e}")
+
+class SensorSimulator:
+    def __init__(self):
+        self.base = {"pH": 7.2, "turbidity": 1.0, "temperature": 25.0, "tds": 150}
+    def read(self):
+        jitter = {
+            "pH": random.uniform(-0.3, 0.3),
+            "turbidity": random.uniform(-0.5, 0.5),
+            "temperature": random.uniform(-0.8, 0.8),
+            "tds": random.uniform(-10, 10)
+        }
+        if random.random() < 0.01:
+            jitter = {k: v * random.uniform(5, 10) for k, v in jitter.items()}
+        return {k: max(0, self.base[k] + jitter[k]) for k in self.base}
+
+class WaterMonitor:
+    def __init__(self, thresholds=None, poll_interval=5, window=MOVING_AVG_WINDOW):
+        self.thresholds = thresholds or DEFAULT_THRESHOLDS
+        self.poll_interval = poll_interval
+        self.window = window
+        self.sensor = SensorSimulator()
+        self.buffers = {k: deque(maxlen=window) for k in self.thresholds}
+        self.last_alert_ts = {}
+        for k in self.thresholds:
+            self.last_alert_ts[k] = datetime.fromtimestamp(0)
+        self.running = False
+        self.lock = threading.Lock()
+    def save_reading(self, r):
+        with DB_LOCK:
+            cur = DB.cursor()
+            cur.execute("INSERT INTO readings(ts, pH, turbidity, temperature, tds) VALUES (?, ?, ?, ?, ?)",
+                        (datetime.utcnow().isoformat(), r["pH"], r["turbidity"], r["temperature"], r["tds"]))
+            DB.commit()
+    def save_event(self, etype, parameter, value, message):
+        with DB_LOCK:
+            cur = DB.cursor()
+            cur.execute("INSERT INTO events(ts, type, parameter, value, message) VALUES (?, ?, ?, ?, ?)",
+                        (datetime.utcnow().isoformat(), etype, parameter, value, message))
+            DB.commit()
+    def check_thresholds(self, reading):
+        alerts = []
+        for param, val in reading.items():
+            th = self.thresholds.get(param)
+            if not th:
+                continue
+            if val < th["min"] or val > th["max"]:
+                alerts.append((param, val, f"{param} out of bounds: {val} (allowed {th['min']} - {th['max']})"))
+        return alerts
+    def check_spike(self, param, value):
+        buf = self.buffers[param]
+        if len(buf) < 2:
+            return None
+        avg = sum(buf) / len(buf)
+        delta = abs(value - avg)
+        th_delta = self.thresholds[param].get("delta", None)
+        if th_delta is not None and delta >= th_delta:
+            return f"{param} spike detected: current {value} vs avg {avg:.2f} (delta {delta:.2f})"
+        return None
+    def process_reading(self, reading):
+        self.save_reading(reading)
+        for k, v in reading.items():
+            self.buffers[k].append(v)
+        alerts = self.check_thresholds(reading)
+        for param, val, msg in alerts:
+            now = datetime.utcnow()
+            if (now - self.last_alert_ts.get(param, datetime.fromtimestamp(0))).total_seconds() >= ALERT_COOLDOWN_SECONDS:
+                self.last_alert_ts[param] = now
+                self.save_event("threshold", param, val, msg)
+                log_alert(msg)
+                send_email_alert(f"Water Quality Alert: {param}", msg)
+        for param, val in reading.items():
+            spike_msg = self.check_spike(param, val)
+            if spike_msg:
+                now = datetime.utcnow()
+                if (now - self.last_alert_ts.get(param, datetime.fromtimestamp(0))).total_seconds() >= ALERT_COOLDOWN_SECONDS:
+                    self.last_alert_ts[param] = now
+                    self.save_event("spike", param, val, spike_msg)
+                    log_alert(spike_msg)
+                    send_email_alert(f"Water Quality Spike: {param}", spike_msg)
+    def run_loop(self):
+        self.running = True
+        while self.running:
+            try:
+                reading = self.sensor.read()
+                self.process_reading(reading)
+            except Exception as e:
+                log_alert(f"Sensor read failed: {e}")
+            time.sleep(self.poll_interval)
+    def start(self):
+        t = threading.Thread(target=self.run_loop, daemon=True)
+        t.start()
+        return t
+    def stop(self):
+        self.running = False
+
+monitor = WaterMonitor()
+
+class SimpleAPIHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/status":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            with DB_LOCK:
+                cur = DB.cursor()
+                cur.execute("SELECT ts, pH, turbidity, temperature, tds FROM readings ORDER BY id DESC LIMIT 1")
+                row = cur.fetchone()
+            out = {"uptime": datetime.utcnow().isoformat()}
+            if row:
+                out["latest"] = {"ts": row[0], "pH": row[1], "turbidity": row[2], "temperature": row[3], "tds": row[4]}
+            else:
+                out["latest"] = None
+            self.wfile.write(json.dumps(out).encode("utf-8"))
+        elif self.path.startswith("/readings"):
+            try:
+                parts = self.path.split("?")
+                limit = 100
+                if len(parts) > 1 and "limit=" in parts[1]:
+                    try:
+                        limit = int(parts[1].split("limit=")[1].split("&")[0])
+                    except:
+                        pass
+            except:
+                limit = 100
+            with DB_LOCK:
+                cur = DB.cursor()
+                cur.execute("SELECT ts, pH, turbidity, temperature, tds FROM readings ORDER BY id DESC LIMIT ?", (limit,))
+                rows = cur.fetchall()
+            out = [{"ts": r[0], "pH": r[1], "turbidity": r[2], "temperature": r[3], "tds": r[4]} for r in rows]
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(out).encode("utf-8"))
+        elif self.path.startswith("/events"):
+            with DB_LOCK:
+                cur = DB.cursor()
+                cur.execute("SELECT ts, type, parameter, value, message FROM events ORDER BY id DESC LIMIT 200")
+                rows = cur.fetchall()
+            out = [{"ts": r[0], "type": r[1], "parameter": r[2], "value": r[3], "message": r[4]} for r in rows]
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(out).encode("utf-8"))
+        else:
+            self.send_response(404)
+            self.end_headers()
+    def log_message(self, format, *args):
+        return
+
+def run_api_server(host="0.0.0.0", port=8000):
+    server = HTTPServer((host, port), SimpleAPIHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server, t
+
+def seed_test_spike():
+    s = SensorSimulator()
+    for _ in range(12):
+        r = s.read()
+        monitor.process_reading(r)
+        time.sleep(0.1)
+    spike = {"pH": 3.0, "turbidity": 50.0, "temperature": 12.0, "tds": 2000}
+    monitor.process_reading(spike)
+
+if __name__ == "__main__":
+    api_server, api_thread = run_api_server()
+    t = monitor.start()
+    seed_test_spike()
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        monitor.stop()
+        api_server.shutdown()
