@@ -4,7 +4,7 @@ class NameErrorException(Exception):
 try:
     name = input("Enter your name: ")
 
-    if name == "Rahul":
+    if name == "Abhishek":
         raise NameErrorException("Access denied! Please quit the program.")
 
     print("Hello,", name)
