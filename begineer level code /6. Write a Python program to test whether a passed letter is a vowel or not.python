@@ -1,0 +1,8 @@
+ch = input("Enter a letter: ").lower()
+
+vowels = ['a', 'e', 'i', 'o', 'u']
+
+if ch in vowels:
+    print("The letter is a vowel.")
+else:
+    print("The letter is not a vowel.")
