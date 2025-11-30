@@ -1,0 +1,10 @@
+import re
+
+pattern = r"^[789]\d{9}$"
+
+mobile = input("Enter mobile number: ")
+
+if re.match(pattern, mobile):
+    print("Valid Mobile Number ✔")
+else:
+    print("Invalid Mobile Number ✘")
