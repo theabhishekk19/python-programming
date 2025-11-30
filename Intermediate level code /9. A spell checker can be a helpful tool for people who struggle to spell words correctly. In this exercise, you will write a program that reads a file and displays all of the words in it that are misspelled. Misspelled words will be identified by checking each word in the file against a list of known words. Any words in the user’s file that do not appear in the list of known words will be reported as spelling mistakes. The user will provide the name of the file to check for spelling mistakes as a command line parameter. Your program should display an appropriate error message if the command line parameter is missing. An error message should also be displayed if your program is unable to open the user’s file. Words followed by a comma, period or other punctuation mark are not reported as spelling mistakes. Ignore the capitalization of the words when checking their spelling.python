@@ -1,0 +1,40 @@
+import sys
+import string
+
+def load_dictionary():
+    return {"this", "is", "a", "sample", "file", "hello", "world", "python",
+            "program", "example", "test", "checking", "words", "spell",
+            "checker", "correct", "spelling"}
+
+def clean_word(word):
+
+    return word.strip(string.punctuation).lower()
+
+def main():
+
+    if len(sys.argv) < 2:
+        print("Error: Missing file name. Usage: python spell_checker.py filename.txt")
+        return
+
+    filename = sys.argv[1]
+
+
+    try:
+        with open(filename, "r") as file:
+            text = file.read()
+    except:
+        print(f"Error: Cannot open file '{filename}'")
+        return
+
+    dictionary = load_dictionary()
+    words = text.split()
+
+    print("\nMisspelled Words:\n")
+
+    for word in words:
+        cleaned = clean_word(word)
+        if cleaned and cleaned not in dictionary:
+            print(word)
+
+if __name__ == "__main__":
+    main()
