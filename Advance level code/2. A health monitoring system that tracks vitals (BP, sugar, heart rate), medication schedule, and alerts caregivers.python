@@ -1,0 +1,239 @@
+import threading
+import time
+import json
+from datetime import datetime, timedelta
+
+DATA_FILE = "health_data.json"
+ALERTS_FILE = "alerts.log"
+
+default_thresholds = {
+    "blood_pressure_sys": (90, 140),
+    "blood_pressure_dia": (60, 90),
+    "heart_rate": (50, 100),
+    "blood_sugar": (70, 180)
+}
+
+lock = threading.Lock()
+
+def load_data():
+    try:
+        with open(DATA_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {"patients": {}}
+
+def save_data(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=2, default=str)
+
+def log_alert(patient_id, message):
+    now = datetime.now().isoformat()
+    with open(ALERTS_FILE, "a") as f:
+        f.write(f"{now} | Patient {patient_id} | {message}\n")
+    print(f"ALERT [{now}] Patient {patient_id}: {message}")
+
+def add_patient(data):
+    pid = input("Enter patient ID: ").strip()
+    name = input("Enter patient name: ").strip()
+    caregiver = input("Enter caregiver contact (phone/email): ").strip()
+    patients = data["patients"]
+    if pid in patients:
+        print("Patient already exists")
+        return
+    patients[pid] = {
+        "name": name,
+        "caregiver": caregiver,
+        "vitals": [],
+        "medications": [],
+        "thresholds": default_thresholds.copy()
+    }
+    save_data(data)
+    print("Patient added")
+
+def record_vitals(data):
+    pid = input("Patient ID: ").strip()
+    patients = data["patients"]
+    if pid not in patients:
+        print("Patient not found")
+        return
+    try:
+        sys = int(input("Systolic BP: ").strip())
+        dia = int(input("Diastolic BP: ").strip())
+        hr = int(input("Heart rate (bpm): ").strip())
+        sugar = float(input("Blood sugar (mg/dL): ").strip())
+    except:
+        print("Invalid input")
+        return
+    entry = {
+        "timestamp": datetime.now().isoformat(),
+        "systolic": sys,
+        "diastolic": dia,
+        "heart_rate": hr,
+        "blood_sugar": sugar
+    }
+    with lock:
+        patients[pid]["vitals"].append(entry)
+        save_data(data)
+    print("Vitals recorded")
+    check_vitals_and_alert(pid, patients[pid], entry)
+
+def schedule_medication(data):
+    pid = input("Patient ID: ").strip()
+    patients = data["patients"]
+    if pid not in patients:
+        print("Patient not found")
+        return
+    med_name = input("Medication name: ").strip()
+    dose = input("Dose (e.g., 5mg / 1 tablet): ").strip()
+    times_raw = input("Times (24h) separated by comma, e.g., 08:00,13:00,20:00: ").strip()
+    try:
+        times = [t.strip() for t in times_raw.split(",") if t.strip()]
+        times_parsed = []
+        for t in times:
+            hh, mm = map(int, t.split(":"))
+            times_parsed.append({"time": f"{hh:02d}:{mm:02d}"})
+    except:
+        print("Invalid time format")
+        return
+    med = {
+        "name": med_name,
+        "dose": dose,
+        "times": times_parsed,
+        "last_notified": {}
+    }
+    with lock:
+        patients[pid]["medications"].append(med)
+        save_data(data)
+    print("Medication scheduled")
+
+def check_vitals_and_alert(pid, patient, entry):
+    th = patient.get("thresholds", default_thresholds)
+    s_low, s_high = th["blood_pressure_sys"]
+    d_low, d_high = th["blood_pressure_dia"]
+    hr_low, hr_high = th["heart_rate"]
+    sugar_low, sugar_high = th["blood_sugar"]
+    msgs = []
+    if entry["systolic"] < s_low or entry["systolic"] > s_high:
+        msgs.append(f"Systolic BP out of range: {entry['systolic']} mmHg")
+    if entry["diastolic"] < d_low or entry["diastolic"] > d_high:
+        msgs.append(f"Diastolic BP out of range: {entry['diastolic']} mmHg")
+    if entry["heart_rate"] < hr_low or entry["heart_rate"] > hr_high:
+        msgs.append(f"Heart rate out of range: {entry['heart_rate']} bpm")
+    if entry["blood_sugar"] < sugar_low or entry["blood_sugar"] > sugar_high:
+        msgs.append(f"Blood sugar out of range: {entry['blood_sugar']} mg/dL")
+    for m in msgs:
+        log_alert(pid, m + f" | Caregiver: {patient.get('caregiver','N/A')}")
+
+def medication_monitor_loop(stop_event):
+    while not stop_event.is_set():
+        with lock:
+            data = load_data()
+            now = datetime.now()
+            cur_time = f"{now.hour:02d}:{now.minute:02d}"
+            for pid, patient in data["patients"].items():
+                meds = patient.get("medications", [])
+                for med in meds:
+                    for t in med.get("times", []):
+                        scheduled = t["time"]
+                        last = med["last_notified"].get(scheduled)
+                        scheduled_dt = datetime.combine(now.date(), datetime.strptime(scheduled, "%H:%M").time())
+                        if cur_time == scheduled:
+                            if last != now.date().isoformat():
+                                message = f"Time to take medication '{med['name']}' ({med['dose']})"
+                                log_alert(pid, message + f" | Caregiver: {patient.get('caregiver','N/A')}")
+                                med["last_notified"][scheduled] = now.date().isoformat()
+            save_data(data)
+        time.sleep(30)
+
+def vitals_monitor_loop(stop_event):
+    while not stop_event.is_set():
+        with lock:
+            data = load_data()
+            for pid, patient in data["patients"].items():
+                vitals = patient.get("vitals", [])
+                if not vitals:
+                    continue
+                latest = vitals[-1]
+                timestamp = datetime.fromisoformat(latest["timestamp"])
+                if datetime.now() - timestamp > timedelta(minutes=60):
+                    log_alert(pid, "No recent vitals recorded in the past 60 minutes")
+                check_vitals_and_alert(pid, patient, latest)
+        time.sleep(300)
+
+def show_patient_report(data):
+    pid = input("Patient ID: ").strip()
+    patients = data["patients"]
+    if pid not in patients:
+        print("Patient not found")
+        return
+    patient = patients[pid]
+    print(f"Report for {patient['name']} (Caregiver: {patient.get('caregiver','N/A')})")
+    print("Medications:")
+    for m in patient.get("medications", []):
+        times = ", ".join([t["time"] for t in m.get("times", [])])
+        print(f"  - {m['name']} | {m['dose']} | Times: {times}")
+    print("Last 5 vitals:")
+    for v in patient.get("vitals", [])[-5:]:
+        ts = v["timestamp"]
+        print(f"  - {ts} | SYS {v['systolic']} / DIA {v['diastolic']} | HR {v['heart_rate']} | Sugar {v['blood_sugar']}")
+
+def set_thresholds(data):
+    pid = input("Patient ID: ").strip()
+    patients = data["patients"]
+    if pid not in patients:
+        print("Patient not found")
+        return
+    try:
+        s_low = int(input("Systolic low: ").strip())
+        s_high = int(input("Systolic high: ").strip())
+        d_low = int(input("Diastolic low: ").strip())
+        d_high = int(input("Diastolic high: ").strip())
+        hr_low = int(input("Heart rate low: ").strip())
+        hr_high = int(input("Heart rate high: ").strip())
+        sugar_low = int(input("Blood sugar low: ").strip())
+        sugar_high = int(input("Blood sugar high: ").strip())
+    except:
+        print("Invalid input")
+        return
+    patients[pid]["thresholds"] = {
+        "blood_pressure_sys": (s_low, s_high),
+        "blood_pressure_dia": (d_low, d_high),
+        "heart_rate": (hr_low, hr_high),
+        "blood_sugar": (sugar_low, sugar_high)
+    }
+    save_data(data)
+    print("Thresholds updated")
+
+def main_menu():
+    data = load_data()
+    stop_event = threading.Event()
+    t1 = threading.Thread(target=medication_monitor_loop, args=(stop_event,), daemon=True)
+    t2 = threading.Thread(target=vitals_monitor_loop, args=(stop_event,), daemon=True)
+    t1.start()
+    t2.start()
+    try:
+        while True:
+            print("\n1) Add patient\n2) Record vitals\n3) Schedule medication\n4) Show patient report\n5) Set thresholds\n6) Exit")
+            choice = input("Choose: ").strip()
+            if choice == "1":
+                add_patient(data)
+            elif choice == "2":
+                record_vitals(data)
+            elif choice == "3":
+                schedule_medication(data)
+            elif choice == "4":
+                show_patient_report(load_data())
+            elif choice == "5":
+                set_thresholds(data)
+            elif choice == "6":
+                print("Exiting...")
+                break
+            else:
+                print("Invalid choice")
+    finally:
+        stop_event.set()
+        t1.join(timeout=1)
+        t2.join(timeout=1)
+
+if __name__ == "__main__":
+    main_menu()
