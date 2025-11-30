@@ -1,0 +1,75 @@
+def calculate_taxable_income(gross_income, deductions_80C_etc, nps_contrib, home_loan_interest_deduction):
+  
+    deduction_80C = min(deductions_80C_etc, 150000)
+    deduction_nps = min(nps_contrib, 50000)
+    deduction_home = home_loan_interest_deduction 
+
+    total_deductions = deduction_80C + deduction_nps + deduction_home
+
+    taxable_income = gross_income - total_deductions
+    if taxable_income < 0:
+        taxable_income = 0
+    return taxable_income
+
+def compute_tax_new_regime(taxable_income):
+    # Slabs FY 2025-26
+    slabs = [(400000, 0.0),
+             (800000, 0.05),
+             (1200000, 0.10),
+             (1600000, 0.15),
+             (2000000, 0.20),
+             (2400000, 0.25)]
+    # above that 30%
+    tax = 0
+    prev_limit = 0
+    for limit, rate in slabs:
+        if taxable_income > limit:
+            tax += (limit - prev_limit) * rate
+            prev_limit = limit
+        else:
+            tax += max(0, taxable_income - prev_limit) * rate
+            return tax
+    # above 24 lakh
+    tax += (taxable_income - 2400000) * 0.30
+    return tax
+
+def compute_tax_old_regime(taxable_income):
+    if taxable_income <= 250000:
+        return 0
+    tax = 0
+    if taxable_income <= 500000:
+        tax += (taxable_income - 250000) * 0.05
+    else:
+        tax += 250000 * 0.05
+        if taxable_income <= 1000000:
+            tax += (taxable_income - 500000) * 0.20
+        else:
+            tax += 500000 * 0.20
+            tax += (taxable_income - 1000000) * 0.30
+    return tax
+
+def calculate_total_tax(gross_income, investments_80C, nps_contrib, home_loan_interest):
+
+    taxable = calculate_taxable_income(gross_income,
+                                        investments_80C,
+                                        nps_contrib,
+                                        home_loan_interest)
+    tax_old = compute_tax_old_regime(taxable)
+    tax_new = compute_tax_new_regime(gross_income)  
+
+
+    return min(tax_old, tax_new), tax_old, tax_new, taxable
+
+
+gross_income = float(input("Enter your total gross income (annual): ₹ "))
+inv_80C = float(input("Total 80C-eligible investments/expenses (PPF, ELSS, NSC, Insurance, ULIP, Tax-saving FD): ₹ "))
+nps = float(input("Your NPS (Tier-I) contribution this year: ₹ "))
+home_loan_interest = float(input("Interest paid on home loan (eligible for deduction): ₹ "))
+
+tax_payable, tax_old, tax_new, taxable_income = calculate_total_tax(
+    gross_income, inv_80C, nps, home_loan_interest)
+
+print(f"\nTaxable income (after deductions, if old regime): ₹ {taxable_income:.2f}")
+print(f"Tax under old regime: ₹ {tax_old:.2f}")
+print(f"Tax under new regime: ₹ {tax_new:.2f}")
+print("You should pay (minimum of both): ₹", round(tax_payable, 2))
