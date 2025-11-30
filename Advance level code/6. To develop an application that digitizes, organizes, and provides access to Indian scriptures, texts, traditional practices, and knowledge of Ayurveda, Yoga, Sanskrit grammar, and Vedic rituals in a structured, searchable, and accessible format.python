@@ -1,0 +1,302 @@
+import os
+import io
+import uuid
+import sqlite3
+from datetime import datetime
+from flask import Flask, request, redirect, url_for, render_template_string, send_file, abort, jsonify
+from werkzeug.utils import secure_filename
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, event
+from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.engine import Engine
+from sqlalchemy.pool import StaticPool
+from PyPDF2 import PdfReader
+try:
+    from PIL import Image
+    import pytesseract
+    OCR_AVAILABLE = True
+except Exception:
+    OCR_AVAILABLE = False
+
+UPLOAD_FOLDER = "uploads"
+DB_PATH = "scriptures.db"
+ALLOWED_EXTENSIONS = {"pdf", "txt", "docx", "png", "jpg", "jpeg"}
+
+app = Flask(__name__)
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+Session = sessionmaker(bind=engine)
+Base = declarative_base()
+
+@event.listens_for(Engine, "connect")
+def _set_sqlite_pragma(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
+
+class Document(Base):
+    __tablename__ = "documents"
+    id = Column(Integer, primary_key=True)
+    uid = Column(String(36), unique=True, index=True)
+    title = Column(String(255))
+    author = Column(String(255))
+    language = Column(String(64))
+    source = Column(String(255))
+    filename = Column(String(255))
+    content = Column(Text)
+    uploaded_at = Column(DateTime, default=datetime.utcnow)
+
+Base.metadata.create_all(engine)
+
+def init_fts():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(title, author, language, source, content, content='documents', content_rowid='id')")
+    cur.execute("INSERT INTO documents_fts(rowid, title, author, language, source, content) SELECT id, title, author, language, source, content FROM documents WHERE id NOT IN (SELECT rowid FROM documents_fts)")
+    conn.commit()
+    conn.close()
+
+init_fts()
+
+def update_fts(doc_id, title, author, language, source, content):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO documents_fts(rowid, title, author, language, source, content) VALUES(?,?,?,?,?,?)", (doc_id, title or "", author or "", language or "", source or "", content or ""))
+    conn.commit()
+    conn.close()
+
+def delete_fts(doc_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM documents_fts WHERE rowid = ?", (doc_id,))
+    conn.commit()
+    conn.close()
+
+def allowed_file(filename):
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def extract_text_from_pdf(path):
+    try:
+        reader = PdfReader(path)
+        text_parts = []
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                text_parts.append(text)
+        return "\n".join(text_parts).strip()
+    except Exception:
+        return ""
+
+def extract_text_from_txt(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        try:
+            with open(path, "r", encoding="latin-1") as f:
+                return f.read()
+        except Exception:
+            return ""
+
+def extract_text_from_image(path):
+    if not OCR_AVAILABLE:
+        return ""
+    try:
+        img = Image.open(path)
+        return pytesseract.image_to_string(img, lang="eng+san") if "san" in pytesseract.get_languages() else pytesseract.image_to_string(img)
+    except Exception:
+        return ""
+
+def save_document_file(file_storage):
+    filename = secure_filename(file_storage.filename)
+    uid = str(uuid.uuid4())
+    name = f"{uid}_{filename}"
+    path = os.path.join(app.config["UPLOAD_FOLDER"], name)
+    file_storage.save(path)
+    return name, path
+
+@app.route("/")
+def index():
+    session = Session()
+    docs = session.query(Document).order_by(Document.uploaded_at.desc()).limit(50).all()
+    session.close()
+    template = """
+    <html><head><title>Digital Scriptures Library</title></head><body>
+    <h1>Digital Scriptures Library</h1>
+    <a href="/upload">Upload Document</a> | <a href="/search">Search</a>
+    <h2>Recent Documents</h2><ul>{% for d in docs %}
+      <li><a href="{{ url_for('view_document', doc_id=d.id) }}">{{ d.title or d.filename }}</a> — {{ d.language or 'Unknown' }} — {{ d.uploaded_at.strftime('%Y-%m-%d') }}</li>
+    {% endfor %}</ul></body></html>
+    """
+    return render_template_string(template, docs=docs)
+
+@app.route("/upload", methods=["GET", "POST"])
+def upload():
+    if request.method == "POST":
+        f = request.files.get("file")
+        title = request.form.get("title")
+        author = request.form.get("author")
+        language = request.form.get("language")
+        source = request.form.get("source")
+        if not f or f.filename == "" or not allowed_file(f.filename):
+            return "No file or unsupported file type", 400
+        saved_name, path = save_document_file(f)
+        ext = saved_name.rsplit(".", 1)[1].lower()
+        content = ""
+        if ext == "pdf":
+            content = extract_text_from_pdf(path)
+        elif ext == "txt":
+            content = extract_text_from_txt(path)
+        elif ext in {"png", "jpg", "jpeg"}:
+            content = extract_text_from_image(path)
+        else:
+            try:
+                content = extract_text_from_txt(path)
+            except Exception:
+                content = ""
+        session = Session()
+        doc = Document(uid=saved_name.split("_",1)[0], title=title, author=author, language=language, source=source, filename=saved_name, content=content, uploaded_at=datetime.utcnow())
+        session.add(doc)
+        session.commit()
+        update_fts(doc.id, doc.title, doc.author, doc.language, doc.source, doc.content)
+        session.close()
+        return redirect(url_for("view_document", doc_id=doc.id))
+    template = """
+    <html><head><title>Upload</title></head><body>
+    <h1>Upload Document</h1>
+    <form method="post" enctype="multipart/form-data">
+    Title: <input name="title"><br>
+    Author: <input name="author"><br>
+    Language: <input name="language"><br>
+    Source: <input name="source"><br>
+    File: <input type="file" name="file"><br>
+    <input type="submit" value="Upload">
+    </form>
+    <p><a href="/">Back</a></p>
+    </body></html>
+    """
+    return render_template_string(template)
+
+@app.route("/document/<int:doc_id>")
+def view_document(doc_id):
+    session = Session()
+    doc = session.query(Document).filter(Document.id == doc_id).first()
+    session.close()
+    if not doc:
+        abort(404)
+    template = """
+    <html><head><title>{{ doc.title or doc.filename }}</title></head><body>
+    <h1>{{ doc.title or doc.filename }}</h1>
+    <p><b>Author:</b> {{ doc.author or 'Unknown' }} | <b>Language:</b> {{ doc.language or 'Unknown' }} | <b>Source:</b> {{ doc.source or 'Unknown' }}</p>
+    <p><a href="{{ url_for('download_document', doc_id=doc.id) }}">Download original file</a> | <a href="{{ url_for('search') }}">Search</a> | <a href="/">Home</a></p>
+    <h2>Content (excerpt)</h2>
+    <pre style="white-space:pre-wrap;max-height:500px;overflow:auto">{{ doc.content[:10000] }}</pre>
+    </body></html>
+    """
+    return render_template_string(template, doc=doc)
+
+@app.route("/download/<int:doc_id>")
+def download_document(doc_id):
+    session = Session()
+    doc = session.query(Document).filter(Document.id == doc_id).first()
+    session.close()
+    if not doc:
+        abort(404)
+    path = os.path.join(app.config["UPLOAD_FOLDER"], doc.filename)
+    if not os.path.exists(path):
+        abort(404)
+    return send_file(path, as_attachment=True, download_name=doc.filename)
+
+@app.route("/search", methods=["GET", "POST"])
+def search():
+    query = request.values.get("q", "")
+    language_filter = request.values.get("language")
+    author_filter = request.values.get("author")
+    results = []
+    if query:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        q = query.replace("'", "''")
+        sql = "SELECT rowid, title, author, language, source, snippet(documents_fts, 5, '<b>', '</b>', '...', 64) as snippet, rank FROM documents_fts WHERE documents_fts MATCH ? LIMIT 100"
+        cur.execute(sql, (q,))
+        rows = cur.fetchall()
+        for r in rows:
+            doc_id, title, author, language, source, snippet = r[0], r[1], r[2], r[3], r[4], r[5]
+            if language_filter and language_filter.lower() not in (language or "").lower():
+                continue
+            if author_filter and author_filter.lower() not in (author or "").lower():
+                continue
+            results.append({"id": doc_id, "title": title, "author": author, "language": language, "source": source, "snippet": snippet})
+        conn.close()
+    template = """
+    <html><head><title>Search</title></head><body>
+    <h1>Search</h1>
+    <form method="get">
+    Query: <input name="q" value="{{ query }}" size="60">
+    Language: <input name="language" value="{{ language_filter }}">
+    Author: <input name="author" value="{{ author_filter }}">
+    <input type="submit" value="Search">
+    </form>
+    <p><a href="/">Home</a></p>
+    {% if results %}
+    <h2>Results</h2>
+    <ul>{% for r in results %}
+      <li><a href="{{ url_for('view_document', doc_id=r.id) }}">{{ r.title or 'Untitled' }}</a> — {{ r.author or 'Unknown' }} — {{ r.language or 'Unknown' }}<div>{{ r.snippet|safe }}</div></li>
+    {% endfor %}</ul>
+    {% endif %}
+    </body></html>
+    """
+    return render_template_string(template, query=query, results=results, language_filter=language_filter, author_filter=author_filter)
+
+@app.route("/api/documents", methods=["GET"])
+def api_list_documents():
+    session = Session()
+    docs = session.query(Document).order_by(Document.uploaded_at.desc()).all()
+    session.close()
+    out = [{"id": d.id, "title": d.title, "author": d.author, "language": d.language, "source": d.source, "uploaded_at": d.uploaded_at.isoformat()} for d in docs]
+    return jsonify(out)
+
+@app.route("/api/document/<int:doc_id>", methods=["GET"])
+def api_get_document(doc_id):
+    session = Session()
+    doc = session.query(Document).filter(Document.id == doc_id).first()
+    session.close()
+    if not doc:
+        return jsonify({"error": "not found"}), 404
+    return jsonify({"id": doc.id, "title": doc.title, "author": doc.author, "language": doc.language, "source": doc.source, "content": doc.content, "uploaded_at": doc.uploaded_at.isoformat()})
+
+@app.route("/api/search", methods=["GET"])
+def api_search():
+    q = request.args.get("q", "")
+    if not q:
+        return jsonify([])
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT rowid, title, author, language, source FROM documents_fts WHERE documents_fts MATCH ? LIMIT 100", (q,))
+    rows = cur.fetchall()
+    conn.close()
+    out = [{"id": r[0], "title": r[1], "author": r[2], "language": r[3], "source": r[4]} for r in rows]
+    return jsonify(out)
+
+@app.route("/admin/delete/<int:doc_id>", methods=["POST"])
+def admin_delete(doc_id):
+    session = Session()
+    doc = session.query(Document).filter(Document.id == doc_id).first()
+    if not doc:
+        session.close()
+        return "Not found", 404
+    path = os.path.join(app.config["UPLOAD_FOLDER"], doc.filename)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+    delete_fts(doc.id)
+    session.delete(doc)
+    session.commit()
+    session.close()
+    return redirect(url_for("index"))
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
